@@ -1,4 +1,6 @@
 from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
@@ -11,11 +13,50 @@ from bs4 import BeautifulSoup
 load_dotenv()
 
 app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
 CORS(app)
 
 logging.basicConfig(level=logging.DEBUG)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+class Project(db.Model):
+    __tablename__ = 'projects'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    website_url = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
+    updated_at = db.Column(db.DateTime, default=db.func.current_timestamp(), onupdate=db.func.current_timestamp())
+
+class Step(db.Model):
+    __tablename__ = 'steps'
+    id = db.Column(db.Integer, primary_key=True)
+    project_id = db.Column(db.Integer, db.ForeignKey('projects.id'))
+    step_number = db.Column(db.Integer, nullable=False)
+    title = db.Column(db.String(255), nullable=False)
+    content = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
+    updated_at = db.Column(db.DateTime, default=db.func.current_timestamp(), onupdate=db.func.current_timestamp())
+
+class WebsiteSummary(db.Model):
+    __tablename__ = 'website_summaries'
+    id = db.Column(db.Integer, primary_key=True)
+    project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), unique=True)
+    content = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
+    updated_at = db.Column(db.DateTime, default=db.func.current_timestamp(), onupdate=db.func.current_timestamp())
+
+class Context(db.Model):
+    __tablename__ = 'contexts'
+    id = db.Column(db.Integer, primary_key=True)
+    project_id = db.Column(db.Integer, db.ForeignKey('projects.id'))
+    step_number = db.Column(db.Integer, nullable=False)
+    content = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
+    updated_at = db.Column(db.DateTime, default=db.func.current_timestamp(), onupdate=db.func.current_timestamp())
 
 def fetch_website_data(url):
     try:
@@ -106,6 +147,31 @@ def generate_prompt(step, context):
     }
     return prompts.get(step, "").format(**context)
 
+@app.route('/api/projects', methods=['GET'])
+def get_projects():
+    try:
+        projects = Project.query.all()
+        return jsonify([
+            {'id': project.id, 'name': project.name, 'website_url': project.website_url}
+            for project in projects
+        ])
+    except Exception as e:
+        logging.error(f"Error in get_projects: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/projects', methods=['POST'])
+def create_project():
+    try:
+        data = request.json
+        new_project = Project(name=data['name'], website_url=data['website_url'])
+        db.session.add(new_project)
+        db.session.commit()
+        return jsonify({'id': new_project.id, 'name': new_project.name, 'website_url': new_project.website_url}), 201
+    except Exception as e:
+        logging.error(f"Error in create_project: {str(e)}")
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/process', methods=['POST'])
 def process_step():
     logging.info("Received request to /api/process")
@@ -114,28 +180,25 @@ def process_step():
         logging.info(f"Received data: {data}")
         
         step = data['step']
+        project_id = data['project_id']
         context = data.get('context', {})
         
+        project = Project.query.get(project_id)
+        if not project:
+            return jsonify({"error": "Project not found"}), 404
+
         if step == 1:
-            website_data = fetch_website_data(context['website'])
+            website_data = fetch_website_data(project.website_url)
             context.update(website_data)
         elif step == 2:
-            context['audit_results'] = context.get('step1_results', '')
+            previous_step = Step.query.filter_by(project_id=project_id, step_number=1).first()
+            context['audit_results'] = previous_step.content if previous_step else ''
         elif step == 5:
-            context['keyword_research'] = context.get('step4_results', '')
-        
-        context['previous_steps'] = "\n".join([context.get(f'step{i}_results', '') for i in range(1, step)])
-        
-        logging.info(f"Processing step {step} with context: {context}")
+            previous_step = Step.query.filter_by(project_id=project_id, step_number=4).first()
+            context['keyword_research'] = previous_step.content if previous_step else ''
         
         prompt = generate_prompt(step, context)
         
-        logging.info(f"Generated prompt: {prompt}")
-        
-        if not client.api_key:
-            raise ValueError("OpenAI API key is not set")
-        
-        logging.info("Sending request to OpenAI API")
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -146,21 +209,26 @@ def process_step():
         
         result = response.choices[0].message.content
         
-        logging.info(f"Received response from OpenAI API: {result[:100]}...")  # Log first 100 chars of response
+        new_step = Step(project_id=project_id, step_number=step, title=f"Step {step}", content=result)
+        db.session.add(new_step)
         
         if step == 1:
-            # Extract website summary from the result
             summary_start = result.find("Website Summary:") + len("Website Summary:")
             summary_end = result.find("2. SEO Audit:")
             website_summary = result[summary_start:summary_end].strip()
-            
-            # Add website summary to the context
-            context['website_summary'] = website_summary
+            new_summary = WebsiteSummary(project_id=project_id, content=website_summary)
+            db.session.add(new_summary)
+        
+        new_context = Context(project_id=project_id, step_number=step, content=context)
+        db.session.add(new_context)
+        
+        db.session.commit()
         
         return jsonify({"response": result, "context": context})
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
         logging.error(traceback.format_exc())
+        db.session.rollback()
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 if __name__ == '__main__':
