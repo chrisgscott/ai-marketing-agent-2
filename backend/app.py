@@ -54,6 +54,8 @@ def generate_prompt(step, context):
         3. Overall UI/UX opportunities
         4. CRO opportunities
         
+        Additionally, provide a brief summary of the website's content and purpose.
+        
         Here's the website data:
         URL: {url}
         Title: {title}
@@ -66,8 +68,16 @@ def generate_prompt(step, context):
         Additional HTML content:
         {full_html}
         
-        Please provide a detailed analysis and specific recommendations for improvement in each area.""",
-        2: "Based on the following audit results, make intelligent guesses on the target client avatar(s) for this business. Give a detailed avatar including demographics, psychographics, pain points, fears, ideal outcomes as it pertains to this business for each of the target avatars. Audit results: {audit_results}",
+        Please structure your response as follows:
+        1. Website Summary: [Brief summary of the website's content and purpose]
+        2. SEO Audit: [Your SEO audit findings]
+        3. Tracking Tags: [Your findings on tracking tags]
+        4. UI/UX Opportunities: [Your UI/UX observations]
+        5. CRO Opportunities: [Your CRO suggestions]""",
+        2: """Based on the following website summary and audit results, make intelligent guesses on the target client avatar(s) for this business. Give a detailed avatar including demographics, psychographics, pain points, fears, ideal outcomes as it pertains to this business for each of the target avatars.
+
+        Website Summary: {website_summary}
+        Audit Results: {audit_results}""",
         3: "Create a list of unique value propositions for the business based on the following information. These value props should be incredibly niche-focused and should be formatted as either: 1. 'We help {{market}} do {{thing}} without {{pain point}}.' 2. '{{service or product}} for {{descriptor}} {{client avatar}}.' 3. 'We help {{avatar}} do {{thing}} so they can {{ideal outcome}}.' Information: {previous_steps}",
         4: """Perform keyword research based on the context from previous steps. Focus on determining:
         1. Main target keyword with a monthly search volume greater than 500, keyword difficulty below 21 and more than 40 related keywords
@@ -95,7 +105,6 @@ def generate_prompt(step, context):
         10: "Give me a list of ideas for other income streams this business could create related to everything we've discussed so far. Each income stream should include a summary of the business, how it would be monetized and any further details necessary to determine if it's something the company wants to pursue. These income streams should include (but not be limited to) online courses, digital downloads, productized services, paid content (newsletters, etc.), monetized directories, memberships and SaaS opportunities. Context: {previous_steps}"
     }
     return prompts.get(step, "").format(**context)
-
 
 @app.route('/api/process', methods=['POST'])
 def process_step():
@@ -139,7 +148,16 @@ def process_step():
         
         logging.info(f"Received response from OpenAI API: {result[:100]}...")  # Log first 100 chars of response
         
-        return jsonify({"response": result})
+        if step == 1:
+            # Extract website summary from the result
+            summary_start = result.find("Website Summary:") + len("Website Summary:")
+            summary_end = result.find("2. SEO Audit:")
+            website_summary = result[summary_start:summary_end].strip()
+            
+            # Add website summary to the context
+            context['website_summary'] = website_summary
+        
+        return jsonify({"response": result, "context": context})
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
         logging.error(traceback.format_exc())
